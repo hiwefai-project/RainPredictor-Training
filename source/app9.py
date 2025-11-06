@@ -168,7 +168,7 @@ class RadarDataset(Dataset):
                 try:
                     with rasterio.open(f) as src:
                         img = src.read(1).astype(np.float32)
-                except Exception as e:
+                except Exception:
                     # marchia non valido e resample indice
                     self.file_validity[f] = False
                     failed = True
@@ -212,14 +212,21 @@ class RadarDataset(Dataset):
                 mask = torch.where(targets > -1.0, 1.0, 0.0)
 
             if self.return_paths:
+                # Guardrail: i path dei target DEVONO avere la stessa lunghezza di pred_length
+                if len(target_frame_paths) != self.pred_length:
+                    raise RuntimeError(
+                        f"target_frame_paths len={len(target_frame_paths)} diversa da pred_length={self.pred_length} "
+                        f"per indice finestra {start}. Controlla i file nella sequenza."
+                    )
                 return inputs, targets, mask, target_frame_paths
             return inputs, targets, mask
 
         # se proprio non riusciamo dopo N tentativi
         raise RasterioIOError(f"Nessuna finestra valida dopo {max_resamples} tentativi; indice iniziale {base_idx}.")
 
+
 # ===============================
-# Modello (encoder/decoder + “trasformer” temporale)
+# Modello (encoder/decoder + “transformer” temporale)
 # ===============================
 class UNet_Encoder(nn.Module):
     def __init__(self, input_channels):
@@ -339,19 +346,53 @@ class RainPredRNN(nn.Module):
             preds.append(y); preds_noact.append(y_no)
         return torch.stack(preds, dim=1), torch.stack(preds_noact, dim=1)
 
+
+# ===============================
+# Collate Fn (VALIDAZIONE)
+# ===============================
+def collate_val(batch):
+    """
+    batch_size=1 → batch è una lista con un solo elemento, cioè la tupla
+    (inputs, targets, mask, paths). Ripristiniamo la batch dimension.
+    """
+    item = batch[0]
+    if len(item) != 4:
+        raise RuntimeError("Validation loader deve restituire (inputs, targets, mask, paths).")
+    inputs, targets, mask, paths = item  # tensors 4D: (Tin, C, H, W)
+
+    # --- normalizza paths a lista piatta di stringhe
+    if isinstance(paths, (list, tuple)) and paths and isinstance(paths[0], (list, tuple)):
+        paths = list(paths[0])
+    elif isinstance(paths, (list, tuple)):
+        paths = list(paths)
+    else:
+        paths = [paths]
+
+    # --- aggiungi batch dimension per tutti i tensori
+    if inputs.dim() == 4:
+        inputs = inputs.unsqueeze(0)   # (1, Tin, C, H, W)
+    if targets.dim() == 4:
+        targets = targets.unsqueeze(0) # (1, Tout, C, H, W)
+    if mask is not None and mask.dim() == 4:
+        mask = mask.unsqueeze(0)       # (1, Tout, C, H, W)
+
+    return inputs, targets, mask, paths
+
+
+
 # ===============================
 # DataLoaders (solo train/val)
 # ===============================
 def create_dataloaders(data_path, batch_size=4, num_workers=4):
-    train_dataset = RadarDataset(os.path.join(data_path, 'train'), is_train=True)
-    val_dataset   = RadarDataset(os.path.join(data_path, 'val'),   is_train=False, return_paths=True)
+    train_dataset = RadarDataset(os.path.join(data_path, 'train'), is_train=True, pred_length=PRED_LENGTH)
+    val_dataset   = RadarDataset(os.path.join(data_path, 'val'),   is_train=False, return_paths=True, pred_length=PRED_LENGTH)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=True,
         persistent_workers=True,
         prefetch_factor=4
@@ -361,11 +402,13 @@ def create_dataloaders(data_path, batch_size=4, num_workers=4):
         batch_size=1,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=True,
-        prefetch_factor=4
+        prefetch_factor=4,
+        collate_fn=collate_val,   # <--- FIX
     )
     return train_loader, val_loader
+
 
 # ===== Benchmark =====
 def _hms(sec: float):
@@ -552,96 +595,30 @@ def evaluate(model, loader, device):
     return agg
 
 
-
 # ===============================
-# Salvataggi preview dalla VAL
+# Salvataggi preview dalla VAL (completi, no duplicati)
 # ===============================
-
-def save_predictions_paired(predictions, targets, target_paths, base_out):
-    os.makedirs(base_out, exist_ok=True)
-    out_pred = os.path.join(base_out, "predictions")
-    out_targ = os.path.join(base_out, "targets")
-    os.makedirs(out_pred, exist_ok=True)
-    os.makedirs(out_targ, exist_ok=True)
-
-    preds = predictions.detach().cpu().numpy()
-    targs = targets.detach().cpu().numpy()
-    preds = preds * 0.5 + 0.5
-    targs = targs * 0.5 + 0.5
-    if preds.ndim == 5: preds = preds.squeeze(2)
-    if targs.ndim == 5: targs = targs.squeeze(2)
-
-    T = preds.shape[1]
-
-    # --- squeeze lista annidata se serve
-    if isinstance(target_paths, (list, tuple)) and target_paths and isinstance(target_paths[0], (list, tuple)):
-        target_paths = target_paths[0]
-
-    # genera nomi se mancano, oppure allinea lunghezze
-    if not target_paths:
-        target_paths = [f"frame_{i:02d}.tiff" for i in range(T)]
-    else:
-        if len(target_paths) < T:
-            target_paths = list(target_paths) + [f"frame_{i:02d}.tiff" for i in range(len(target_paths), T)]
-        elif len(target_paths) > T:
-            target_paths = list(target_paths)[:T]
-
-    for t in range(T):
-        stem = os.path.splitext(os.path.basename(target_paths[t]))[0]
-        frame_p = (preds[0, t] * 255.0).clip(0, 255).astype(np.uint8)
-        frame_t = (targs[0, t] * 255.0).clip(0, 255).astype(np.uint8)
-        Image.fromarray(frame_p).save(os.path.join(out_pred, f"{stem}_pred.tiff"))
-        Image.fromarray(frame_t).save(os.path.join(out_targ, f"{stem}_target.tiff"))
-
-
-def save_val_previews(model, val_loader, device, out_root, epoch, max_batches=2):
-    model.eval()
-    ep_dir = os.path.join(out_root, f"epoch_{epoch:03d}")
-    os.makedirs(ep_dir, exist_ok=True)
-    with torch.no_grad():
-        for i, batch in enumerate(val_loader):
-            if i >= max_batches: break
-            if len(batch) == 4:
-                inputs, targets, mask, paths = batch
-                # --- squeeze per batch_size=1: [[...]] -> [...]
-                if isinstance(paths, (list, tuple)) and paths and isinstance(paths[0], (list, tuple)):
-                    paths = paths[0]
-            else:
-                inputs, targets, mask = batch
-                paths = None
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            outputs, _ = model(inputs, PRED_LENGTH)
-            save_predictions_paired(outputs, targets, paths, base_out=ep_dir)
-
-'''
 def save_all_val_predictions(model, val_loader, device, out_root, epoch,
                              overwrite=False):
     """
     Esegue la forward su TUTTA la validation e salva una sola prediction
     per ciascun TIFF target, usando SEMPRE il nome reale (da target_paths).
-    Non usa nomi sintetici. Se i path non ci sono, solleva errore.
     """
     model.eval()
     ep_dir = os.path.join(out_root, f"epoch_{epoch:03d}")
     out_pred = os.path.join(ep_dir, "predictions")
     os.makedirs(out_pred, exist_ok=True)
 
-    # set per evitare duplicati dovuti a finestre sovrapposte
     saved = set()
 
     with torch.no_grad():
         for batch in val_loader:
-            # Val loader deve avere return_paths=True (già così nel tuo create_dataloaders)
             if len(batch) != 4:
                 raise RuntimeError("Validation loader deve restituire (inputs, targets, mask, paths).")
 
             inputs, targets, mask, paths = batch
 
-            # squeeze per batch_size=1: [[...]] -> [...]
-            if isinstance(paths, (list, tuple)) and paths and isinstance(paths[0], (list, tuple)):
-                paths = paths[0]
-
+            # paths è già lista piatta grazie al collate_val
             if not paths or len(paths) == 0:
                 raise RuntimeError("Mancano i target_paths nella validation: disabilitato il fallback frame_XX.")
 
@@ -657,7 +634,6 @@ def save_all_val_predictions(model, val_loader, device, out_root, epoch,
             if len(paths) < T:
                 raise RuntimeError(f"I target_paths ({len(paths)}) sono meno dei frame predetti ({T}).")
             if len(paths) > T:
-                # Troncamento conservativo (non generiamo nomi fittizi)
                 paths = list(paths)[:T]
 
             for t in range(T):
@@ -687,8 +663,7 @@ def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
 
         _, targets, _, paths = batch
 
-        if isinstance(paths, (list, tuple)) and paths and isinstance(paths[0], (list, tuple)):
-            paths = paths[0]
+        # paths è già lista piatta grazie al collate_val
         if not paths or len(paths) == 0:
             raise RuntimeError("Mancano i target_paths nella validation: disabilitato il fallback frame_XX.")
 
@@ -716,15 +691,14 @@ def save_all_val_targets(val_loader, out_root, epoch, overwrite=False):
 
             frame = (targs[t] * 255.0).clip(0, 255).astype(np.uint8)
             Image.fromarray(frame).save(out_path)
-'''
- 
+
 
 # ===============================
 # MAIN
 # ===============================
 if __name__ == "__main__":
     # Path degli split “clean” (train/val)
-    DATA_PATH = os.path.abspath("/storage/external_01/hiwefi/data/rdr0_5k_splits")
+    DATA_PATH = os.path.abspath("/home/v.bucciero/data/instruments/rdr0_splits/")
 
     # logging & writers
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -756,9 +730,8 @@ if __name__ == "__main__":
     print(f"[Benchmark] Train: ~{bps_train:.2f} batch/s | steps/epoch={steps_train} | ETA epoca ≈ {_hms(eta_train)}")
     print(f"[Benchmark] Val  : ~{bps_val:.2f} batch/s | steps/val  ={steps_val}   | ETA val   ≈ {_hms(eta_val)}")
 
-
     # dove salvo le anteprime dalla validation ad ogni epoca
-    VAL_PREVIEW_ROOT = "/storage/external_01/hiwefi/data/rdr0_val_previews"
+    VAL_PREVIEW_ROOT = "/home/v.bucciero/data/instruments/rdr0_previews_h100gpu"
     os.makedirs(VAL_PREVIEW_ROOT, exist_ok=True)
 
     best_val = float('inf')
@@ -778,10 +751,9 @@ if __name__ == "__main__":
             tag = "Loss" if k.lower() == "total" else k
             val_writer.add_scalar(tag, float(v), epoch)
 
-        # salva qualche immagine pred/target dalla VAL
-        save_val_previews(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, max_batches=2)
-        # save_all_val_predictions(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, overwrite=False)
-        # save_all_val_targets(val_loader, VAL_PREVIEW_ROOT, epoch, overwrite=False)
+        # salva tutte le predizioni/target della VAL con nomi reali
+        save_all_val_predictions(model, val_loader, DEVICE, VAL_PREVIEW_ROOT, epoch, overwrite=False)
+        save_all_val_targets(val_loader, VAL_PREVIEW_ROOT, epoch, overwrite=False)
 
         # checkpoint sul best validation
         if val_metrics['TOTAL'] < best_val:
